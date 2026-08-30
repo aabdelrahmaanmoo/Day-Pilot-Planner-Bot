@@ -33,7 +33,16 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-flash-latest"
+
+
+def log_available_models():
+    """Log which models this API key can actually use, to make future debugging instant."""
+    try:
+        names = [m.name for m in client.models.list() if "generateContent" in (m.supported_actions or [])]
+        logger.info(f"AVAILABLE MODELS FOR THIS KEY: {names}")
+    except Exception as e:
+        logger.error(f"Could not list models: {e}")
 
 DB_PATH = "tasks.db"
 HISTORY_TURNS = 6  # how many past messages to keep as conversation context
@@ -333,6 +342,7 @@ async def check_reminders(app: Application):
 
 def main():
     init_db()
+    log_available_models()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
