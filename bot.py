@@ -1,5 +1,5 @@
 """
-Telegram Task Manager Bot - powered by Gemini (free tier)
+Telegram Task Manager Bot - powered by Gemini (free tier) via the Interactions API.
 Natural conversation: understands text & voice, asks follow-up questions,
 extracts/organizes tasks, and sends reminders.
 """
@@ -12,7 +12,6 @@ import logging
 from datetime import datetime, timedelta
 
 from google import genai
-from google.genai import types
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,19 +32,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
-
-
-def log_available_models():
-    """Log which models this API key can actually use, to make future debugging instant."""
-    try:
-        names = [m.name for m in client.models.list() if "generateContent" in (m.supported_actions or [])]
-        logger.info(f"AVAILABLE MODELS FOR THIS KEY: {names}")
-    except Exception as e:
-        logger.error(f"Could not list models: {e}")
+MODEL_NAME = "gemini-3.7-flash"
 
 DB_PATH = "tasks.db"
-HISTORY_TURNS = 6  # how many past messages to keep as conversation context
 
 SYSTEM_PROMPT = """انت مساعد شخصي بتتكلم مع المستخدم بشكل طبيعي وودود باللهجة المصرية، ومتخصص في تنظيم التاسكات (المهام) اليومية.
 
@@ -83,12 +72,9 @@ def init_db():
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS chat_state (
+            chat_id INTEGER PRIMARY KEY,
+            last_interaction_id TEXT
         )
         """
     )
@@ -96,28 +82,21 @@ def init_db():
     conn.close()
 
 
-def get_history(chat_id: int) -> list:
+def get_last_interaction_id(chat_id: int):
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT role, content FROM chat_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-        (chat_id, HISTORY_TURNS),
-    ).fetchall()
+    row = conn.execute(
+        "SELECT last_interaction_id FROM chat_state WHERE chat_id=?", (chat_id,)
+    ).fetchone()
     conn.close()
-    return list(reversed(rows))
+    return row[0] if row else None
 
 
-def save_history(chat_id: int, role: str, content: str):
+def save_last_interaction_id(chat_id: int, interaction_id: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO chat_history (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-        (chat_id, role, content, datetime.now().isoformat()),
-    )
-    # keep table small: delete anything beyond last 20 turns per chat
-    conn.execute(
-        """DELETE FROM chat_history WHERE chat_id=? AND id NOT IN (
-             SELECT id FROM chat_history WHERE chat_id=? ORDER BY id DESC LIMIT 20
-           )""",
-        (chat_id, chat_id),
+        """INSERT INTO chat_state (chat_id, last_interaction_id) VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET last_interaction_id=excluded.last_interaction_id""",
+        (chat_id, interaction_id),
     )
     conn.commit()
     conn.close()
@@ -126,9 +105,9 @@ def save_history(chat_id: int, role: str, content: str):
 def parse_reply(raw: str):
     """Split Gemini's reply into (user_facing_text, tasks_list)."""
     tasks = []
-    reply_text = raw.strip()
+    reply_text = (raw or "").strip()
 
-    match = re.search(r"TASKS:\s*(\[.*\])\s*$", raw, re.DOTALL)
+    match = re.search(r"TASKS:\s*(\[.*\])\s*$", raw or "", re.DOTALL)
     if match:
         json_part = match.group(1)
         reply_text = raw[: match.start()].strip()
@@ -142,24 +121,6 @@ def parse_reply(raw: str):
         reply_text = "تمام 👍"
 
     return reply_text, tasks
-
-
-def build_contents(chat_id: int, new_parts: list) -> list:
-    """Build the multi-turn contents list for Gemini from stored history + new message.
-    new_parts: list of strings and/or types.Part (e.g. uploaded audio file)."""
-    contents = []
-    for role, content in get_history(chat_id):
-        gemini_role = "user" if role == "user" else "model"
-        contents.append(types.Content(role=gemini_role, parts=[types.Part.from_text(text=content)]))
-
-    parts = []
-    for p in new_parts:
-        if isinstance(p, str):
-            parts.append(types.Part.from_text(text=p))
-        else:
-            parts.append(p)  # already a types.Part (e.g. uploaded file)
-    contents.append(types.Content(role="user", parts=parts))
-    return contents
 
 
 def save_tasks(chat_id: int, tasks: list) -> list:
@@ -196,26 +157,36 @@ def format_added_tasks(added: list) -> str:
     return "\n".join(lines)
 
 
+def run_interaction(chat_id: int, content_input):
+    """Call the Gemini Interactions API, chaining conversation via previous_interaction_id."""
+    prev_id = get_last_interaction_id(chat_id)
+    kwargs = dict(
+        model=MODEL_NAME,
+        input=content_input,
+        system_instruction=SYSTEM_PROMPT,
+        store=True,
+    )
+    if prev_id:
+        kwargs["previous_interaction_id"] = prev_id
+
+    interaction = client.interactions.create(**kwargs)
+    save_last_interaction_id(chat_id, interaction.id)
+    return interaction.output_text
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     text = update.message.text
     await update.message.chat.send_action("typing")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-    contents = build_contents(chat_id, [f"(النهارده {now}) {text}"])
+    prompt = f"(النهارده {now}) {text}"
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-    )
-    reply_text, tasks = parse_reply(response.text)
+    output_text = run_interaction(chat_id, prompt)
+    reply_text, tasks = parse_reply(output_text)
 
     added = save_tasks(chat_id, tasks)
     final_reply = reply_text + format_added_tasks(added)
-
-    save_history(chat_id, "user", text)
-    save_history(chat_id, "model", reply_text)
 
     await update.message.reply_text(final_reply)
 
@@ -233,25 +204,19 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         with open(file_path, "rb") as f:
             audio_bytes = f.read()
-        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
-        contents = build_contents(
-            chat_id, [f"(النهارده {now}) استمع للرسالة الصوتية دي:", audio_part]
-        )
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        )
+
+        content_input = [
+            {"type": "text", "text": f"(النهارده {now}) استمع للرسالة الصوتية دي:"},
+            {"type": "audio", "data": audio_bytes, "mime_type": "audio/ogg"},
+        ]
+        output_text = run_interaction(chat_id, content_input)
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
 
-    reply_text, tasks = parse_reply(response.text)
+    reply_text, tasks = parse_reply(output_text)
     added = save_tasks(chat_id, tasks)
     final_reply = reply_text + format_added_tasks(added)
-
-    save_history(chat_id, "user", "[رسالة صوتية]")
-    save_history(chat_id, "model", reply_text)
 
     await update.message.reply_text(final_reply)
 
@@ -342,7 +307,6 @@ async def check_reminders(app: Application):
 
 def main():
     init_db()
-    log_available_models()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
