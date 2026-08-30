@@ -32,7 +32,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-3.7-flash"
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 DB_PATH = "tasks.db"
 
@@ -157,21 +157,48 @@ def format_added_tasks(added: list) -> str:
     return "\n".join(lines)
 
 
-def run_interaction(chat_id: int, content_input):
-    """Call the Gemini Interactions API, chaining conversation via previous_interaction_id."""
-    prev_id = get_last_interaction_id(chat_id)
-    kwargs = dict(
-        model=MODEL_NAME,
-        input=content_input,
-        system_instruction=SYSTEM_PROMPT,
-        store=True,
-    )
-    if prev_id:
-        kwargs["previous_interaction_id"] = prev_id
+def is_transient_gemini_error(error: Exception) -> bool:
+    """True if the error is likely temporary (worth trying a fallback model),
+    False if it's a permanent problem (bad key, bad request) that no fallback will fix."""
+    text = str(error).lower()
+    transient_signals = [
+        "high demand", "internal server error", "service unavailable",
+        "unavailable", "500", "502", "503", "504", "429",
+        "rate limit", "too many requests",
+    ]
+    return any(signal in text for signal in transient_signals)
 
-    interaction = client.interactions.create(**kwargs)
-    save_last_interaction_id(chat_id, interaction.id)
-    return interaction.output_text
+
+def run_interaction(chat_id: int, content_input):
+    """Call the Gemini Interactions API, chaining conversation via previous_interaction_id.
+    Tries each model in GEMINI_MODELS in order on transient errors (e.g. temporary high demand)."""
+    prev_id = get_last_interaction_id(chat_id)
+
+    last_error = None
+    for model_name in GEMINI_MODELS:
+        kwargs = dict(
+            model=model_name,
+            input=content_input,
+            system_instruction=SYSTEM_PROMPT,
+            store=True,
+        )
+        if prev_id:
+            kwargs["previous_interaction_id"] = prev_id
+
+        try:
+            interaction = client.interactions.create(**kwargs)
+            save_last_interaction_id(chat_id, interaction.id)
+            return interaction.output_text
+        except Exception as e:
+            last_error = e
+            if not is_transient_gemini_error(e):
+                logger.exception(f"Non-transient Gemini error on {model_name}")
+                raise
+            logger.warning(f"Gemini model {model_name} temporarily failed: {e}")
+            continue
+
+    logger.error("All Gemini fallback models failed")
+    raise last_error
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,7 +209,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
     prompt = f"(النهارده {now}) {text}"
 
-    output_text = run_interaction(chat_id, prompt)
+    try:
+        output_text = run_interaction(chat_id, prompt)
+    except Exception:
+        await update.message.reply_text("النظام مزحوم شوية دلوقتي، جرب تاني كمان ثواني 🙏")
+        return
+
     reply_text, tasks = parse_reply(output_text)
 
     added = save_tasks(chat_id, tasks)
@@ -209,7 +241,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"type": "text", "text": f"(النهارده {now}) استمع للرسالة الصوتية دي:"},
             {"type": "audio", "data": audio_bytes, "mime_type": "audio/ogg"},
         ]
-        output_text = run_interaction(chat_id, content_input)
+        try:
+            output_text = run_interaction(chat_id, content_input)
+        except Exception:
+            await update.message.reply_text("النظام مزحوم شوية دلوقتي، جرب تاني كمان ثواني 🙏")
+            return
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
@@ -305,6 +341,10 @@ async def check_reminders(app: Application):
     conn.close()
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled Telegram error", exc_info=context.error)
+
+
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -314,6 +354,7 @@ def main():
     app.add_handler(CommandHandler("done", done_task))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_error_handler(error_handler)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_reminders, "interval", minutes=5, args=[app])
