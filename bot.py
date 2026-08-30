@@ -11,7 +11,8 @@ import sqlite3
 import logging
 from datetime import datetime, timedelta
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -31,8 +32,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3.6-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-2.5-flash"
 
 DB_PATH = "tasks.db"
 HISTORY_TURNS = 6  # how many past messages to keep as conversation context
@@ -135,12 +136,20 @@ def parse_reply(raw: str):
 
 
 def build_contents(chat_id: int, new_parts: list) -> list:
-    """Build the multi-turn contents list for Gemini from stored history + new message."""
-    contents = [{"role": "user", "parts": [SYSTEM_PROMPT]}, {"role": "model", "parts": ["فهمت، جاهز."]}]
+    """Build the multi-turn contents list for Gemini from stored history + new message.
+    new_parts: list of strings and/or types.Part (e.g. uploaded audio file)."""
+    contents = []
     for role, content in get_history(chat_id):
         gemini_role = "user" if role == "user" else "model"
-        contents.append({"role": gemini_role, "parts": [content]})
-    contents.append({"role": "user", "parts": new_parts})
+        contents.append(types.Content(role=gemini_role, parts=[types.Part.from_text(text=content)]))
+
+    parts = []
+    for p in new_parts:
+        if isinstance(p, str):
+            parts.append(types.Part.from_text(text=p))
+        else:
+            parts.append(p)  # already a types.Part (e.g. uploaded file)
+    contents.append(types.Content(role="user", parts=parts))
     return contents
 
 
@@ -186,7 +195,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
     contents = build_contents(chat_id, [f"(النهارده {now}) {text}"])
 
-    response = model.generate_content(contents)
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=contents,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+    )
     reply_text, tasks = parse_reply(response.text)
 
     added = save_tasks(chat_id, tasks)
@@ -209,10 +222,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        audio_file = genai.upload_file(path=file_path, mime_type="audio/ogg")
-        contents = build_contents(chat_id, [f"(النهارده {now}) استمع للرسالة الصوتية دي:", audio_file])
-        response = model.generate_content(contents)
-        genai.delete_file(audio_file.name)
+        with open(file_path, "rb") as f:
+            audio_bytes = f.read()
+        audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
+        contents = build_contents(
+            chat_id, [f"(النهارده {now}) استمع للرسالة الصوتية دي:", audio_part]
+        )
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+        )
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
