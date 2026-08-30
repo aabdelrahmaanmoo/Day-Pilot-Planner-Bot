@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "models/gemini-2.5-flash"
+client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(api_version="v1"))
+MODEL_NAME = "gemini-2.5-flash"
 
 
 def log_available_models():
