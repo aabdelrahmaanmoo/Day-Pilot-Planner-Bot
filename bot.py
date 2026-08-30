@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(api_version="v1"))
+client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
 
 
@@ -355,7 +355,7 @@ def main():
     scheduler.add_job(check_reminders, "interval", minutes=5, args=[app])
     scheduler.start()
 
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
