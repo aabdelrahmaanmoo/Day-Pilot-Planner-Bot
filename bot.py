@@ -209,7 +209,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        audio_file = genai.upload_file(path=file_path)
+        audio_file = genai.upload_file(path=file_path, mime_type="audio/ogg")
         contents = build_contents(chat_id, [f"(النهارده {now}) استمع للرسالة الصوتية دي:", audio_file])
         response = model.generate_content(contents)
         genai.delete_file(audio_file.name)
