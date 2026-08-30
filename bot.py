@@ -1,9 +1,11 @@
 """
 Telegram Task Manager Bot - powered by Gemini (free tier)
-Sends free-text messages -> Gemini extracts structured tasks -> stores in SQLite -> sends reminders.
+Natural conversation: understands text & voice, asks follow-up questions,
+extracts/organizes tasks, and sends reminders.
 """
 
 import os
+import re
 import json
 import sqlite3
 import logging
@@ -20,6 +22,9 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+VOICE_DIR = "voices"
+os.makedirs(VOICE_DIR, exist_ok=True)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,24 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 DB_PATH = "tasks.db"
+HISTORY_TURNS = 6  # how many past messages to keep as conversation context
+
+SYSTEM_PROMPT = """انت مساعد شخصي بتتكلم مع المستخدم بشكل طبيعي وودود باللهجة المصرية، ومتخصص في تنظيم التاسكات (المهام) اليومية.
+
+قواعد مهمة:
+- لو المستخدم ذكر حاجة عايز يعملها (تاسك)، افهمها واستخرجها.
+- لو التاسك ناقص تفاصيل مهمة (زي الميعاد) واحتاجت تسأل، اسأل سؤال طبيعي قصير بدل ما تفترض.
+- لو المستخدم بيرد على سؤالك (زي بيحدد ميعاد)، اربط ردّه بالتاسك اللي كان ناقص من المحادثة اللي فاتت.
+- لو مفيش تاسك في الرسالة (المستخدم بيسلم عليك بس أو بيسأل سؤال عادي)، رد عادي من غير ما تستخرج تاسكات.
+- ردودك تبقى طبيعية ومختصرة، زي ما صاحب بيرد على صاحبه.
+
+مهم جدًا: في آخر ردك، لازم تحط سطر منفصل يبدأ بـ TASKS: متبوع بـ JSON array لأي تاسكات جاهزة للحفظ (عندها title واضح، due_date لو موجود بصيغة YYYY-MM-DD HH:MM أو null، priority: high/medium/low).
+لو مفيش تاسكات جاهزة للحفظ دلوقتي (زي لو لسه بتسأل سؤال متابعة)، حط: TASKS: []
+
+مثال لرد كامل:
+تمام، حددتلك ميعاد البنك الساعة 9 الصبح بكرة 👍
+TASKS: [{"title": "اروح البنك", "due_date": "2025-01-15 09:00", "priority": "high"}]
+"""
 
 
 def init_db():
@@ -48,61 +71,86 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
 
-def extract_tasks_with_gemini(text: str) -> list:
-    """Ask Gemini to parse free text into structured tasks."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-    prompt = f"""انت مساعد بينظم تاسكات. النهارده {now}.
-حلل الرسالة دي واستخرج التاسكات المذكورة فيها. لكل تاسك حدد:
-- title: عنوان التاسك (مختصر وواضح)
-- due_date: التاريخ والوقت بصيغة "YYYY-MM-DD HH:MM" لو موجود، أو null لو مفيش تاريخ محدد
-- priority: "high" أو "medium" أو "low" حسب أهمية التاسك من السياق
-
-رجع JSON array بس، من غير أي شرح أو markdown. مثال:
-[{{"title": "اروح البنك", "due_date": "2025-01-15 09:00", "priority": "high"}}]
-
-الرسالة: {text}"""
-
-    response = model.generate_content(prompt)
-    raw = response.text.strip()
-    # Strip markdown code fences if Gemini adds them
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
-    try:
-        tasks = json.loads(raw)
-        if isinstance(tasks, dict):
-            tasks = [tasks]
-        return tasks
-    except json.JSONDecodeError:
-        logger.error(f"Failed to parse Gemini response: {raw}")
-        return []
+def get_history(chat_id: int) -> list:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT role, content FROM chat_history WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+        (chat_id, HISTORY_TURNS),
+    ).fetchall()
+    conn.close()
+    return list(reversed(rows))
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.message.chat_id
+def save_history(chat_id: int, role: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO chat_history (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, role, content, datetime.now().isoformat()),
+    )
+    # keep table small: delete anything beyond last 20 turns per chat
+    conn.execute(
+        """DELETE FROM chat_history WHERE chat_id=? AND id NOT IN (
+             SELECT id FROM chat_history WHERE chat_id=? ORDER BY id DESC LIMIT 20
+           )""",
+        (chat_id, chat_id),
+    )
+    conn.commit()
+    conn.close()
 
-    await update.message.chat.send_action("typing")
 
-    tasks = extract_tasks_with_gemini(text)
+def parse_reply(raw: str):
+    """Split Gemini's reply into (user_facing_text, tasks_list)."""
+    tasks = []
+    reply_text = raw.strip()
 
+    match = re.search(r"TASKS:\s*(\[.*\])\s*$", raw, re.DOTALL)
+    if match:
+        json_part = match.group(1)
+        reply_text = raw[: match.start()].strip()
+        try:
+            tasks = json.loads(json_part)
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse TASKS json: {json_part}")
+            tasks = []
+
+    if not reply_text:
+        reply_text = "تمام 👍"
+
+    return reply_text, tasks
+
+
+def build_contents(chat_id: int, new_parts: list) -> list:
+    """Build the multi-turn contents list for Gemini from stored history + new message."""
+    contents = [{"role": "user", "parts": [SYSTEM_PROMPT]}, {"role": "model", "parts": ["فهمت، جاهز."]}]
+    for role, content in get_history(chat_id):
+        gemini_role = "user" if role == "user" else "model"
+        contents.append({"role": gemini_role, "parts": [content]})
+    contents.append({"role": "user", "parts": new_parts})
+    return contents
+
+
+def save_tasks(chat_id: int, tasks: list) -> list:
     if not tasks:
-        await update.message.reply_text(
-            "معرفتش أفهم تاسكات من الرسالة دي 🤔 جرب تكتبها بشكل تاني."
-        )
-        return
-
+        return []
     conn = sqlite3.connect(DB_PATH)
     added = []
     for t in tasks:
-        title = t.get("title", "").strip()
+        title = (t.get("title") or "").strip()
         if not title:
             continue
         due_date = t.get("due_date")
@@ -114,20 +162,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         added.append((title, due_date, priority))
     conn.commit()
     conn.close()
+    return added
 
+
+def format_added_tasks(added: list) -> str:
     if not added:
-        await update.message.reply_text("معرفتش أفهم تاسكات من الرسالة دي 🤔")
-        return
-
+        return ""
     priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}
-    lines = ["✅ ضفت التاسكات دي:\n"]
+    lines = ["\n\n📌 اتسجل:"]
     for title, due_date, priority in added:
         line = f"{priority_emoji.get(priority, '🟡')} {title}"
         if due_date:
             line += f" — {due_date}"
         lines.append(line)
+    return "\n".join(lines)
 
-    await update.message.reply_text("\n".join(lines))
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    text = update.message.text
+    await update.message.chat.send_action("typing")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+    contents = build_contents(chat_id, [f"(النهارده {now}) {text}"])
+
+    response = model.generate_content(contents)
+    reply_text, tasks = parse_reply(response.text)
+
+    added = save_tasks(chat_id, tasks)
+    final_reply = reply_text + format_added_tasks(added)
+
+    save_history(chat_id, "user", text)
+    save_history(chat_id, "model", reply_text)
+
+    await update.message.reply_text(final_reply)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    await update.message.chat.send_action("typing")
+
+    voice = update.message.voice or update.message.audio
+    tg_file = await context.bot.get_file(voice.file_id)
+    file_path = os.path.join(VOICE_DIR, f"{voice.file_id}.ogg")
+    await tg_file.download_to_drive(file_path)
+
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        audio_file = genai.upload_file(path=file_path)
+        contents = build_contents(chat_id, [f"(النهارده {now}) استمع للرسالة الصوتية دي:", audio_file])
+        response = model.generate_content(contents)
+        genai.delete_file(audio_file.name)
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    reply_text, tasks = parse_reply(response.text)
+    added = save_tasks(chat_id, tasks)
+    final_reply = reply_text + format_added_tasks(added)
+
+    save_history(chat_id, "user", "[رسالة صوتية]")
+    save_history(chat_id, "model", reply_text)
+
+    await update.message.reply_text(final_reply)
 
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -181,8 +278,7 @@ async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً! ابعتلي أي حاجة عايز تعملها وأنا هنظمهالك تاسكات.\n\n"
-        "مثال: \"عايز اروح البنك بكرة الصبح وابعت الايميل النهاردة\"\n\n"
+        "أهلاً! أنا مساعدك الشخصي 🙂 كلمني عادي (كتابة أو صوت) عن أي حاجة عايز تعملها وأنا هنظمهالك.\n\n"
         "الأوامر:\n"
         "/tasks - شوف التاسكات المفتوحة\n"
         "/done [رقم] - اقفل تاسك"
@@ -190,7 +286,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_reminders(app: Application):
-    """Runs periodically; sends reminders for tasks due soon."""
     conn = sqlite3.connect(DB_PATH)
     now = datetime.now()
     window_end = now + timedelta(hours=1)
@@ -224,6 +319,7 @@ def main():
     app.add_handler(CommandHandler("tasks", list_tasks))
     app.add_handler(CommandHandler("done", done_task))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_reminders, "interval", minutes=5, args=[app])
